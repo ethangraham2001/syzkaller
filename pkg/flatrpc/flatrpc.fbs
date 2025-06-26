@@ -47,6 +47,11 @@ table ConnectRequestRaw {
 	syz_revision		:string;
 }
 
+table KFuzzTargetRaw {
+	func_name	:string;
+	func_arg_type	:string;
+}
+
 table ConnectReplyRaw {
 	debug			:bool;
 	cover			:bool;
@@ -68,6 +73,7 @@ table InfoRequestRaw {
 	error			:string;
 	features		:[FeatureInfoRaw];
 	files			:[FileInfoRaw];
+	kfuzz_targets		:[KFuzzTargetRaw];
 }
 
 table InfoReplyRaw {
