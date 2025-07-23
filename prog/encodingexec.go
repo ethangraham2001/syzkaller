@@ -158,7 +158,7 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 	// to some struct input. This is the data that must be flattened and sent
 	// to the fuzzing driver with a relocation table.
 	dataArg := c.Args[1].(*PointerArg)
-	finalBlob := marshallKFuzztestArg(dataArg.Res)
+	finalBlob := MarshallKFuzztestArg(dataArg.Res)
 
 	// Reuse the memory address that was pre-allocated for the original struct
 	// argument. This avoids needing to hook into the memory allocation which
@@ -252,7 +252,7 @@ const kFuzzTestNilPtrVal uint64 = ^uint64(0)
 // Number of integers of padding
 const relocationTablePaddingInts uint32 = 2
 
-// marshallKFuzztestArg serializes a top-level struct argument (`topLevel`) into
+// MarshallKFuzztestArg serializes a top-level struct argument (`topLevel`) into
 // a single binary blob that can be consumed by the kernel. The output format,
 // defined in `linux/include/kftf.h`, is designed for position-independent data
 // transfer and consists of a relocation table followed by a raw data payload.
@@ -277,7 +277,7 @@ const relocationTablePaddingInts uint32 = 2
 //     relative offset between the pointer's location and its target data.
 //  4. Finally, the completed `relocation_table` is serialized and prepended to
 //     the `payload` buffer to form the complete binary blob.
-func marshallKFuzztestArg(topLevel Arg) []byte {
+func MarshallKFuzztestArg(topLevel Arg) []byte {
 	type deferredPtr struct {
 		pointedToArg Arg
 		pointer      uint64
