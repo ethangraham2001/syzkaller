@@ -1,0 +1,7 @@
+my_fun_func_arg {
+        string          ptr[in, string]
+        buffer          ptr[inout, array[int8]]
+        buffer_size     len[buffer, int64]
+}
+
+syz_kfuzztest_run$my_memncpy(name ptr[in, string["my_memncpy"]], data ptr[in, my_fun_func_arg], len bytesize[data])
