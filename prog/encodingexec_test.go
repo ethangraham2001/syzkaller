@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/VividCortex/gohistogram"
@@ -759,4 +760,150 @@ func TestSerializeForExecOverflow(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Produces a side-by-side hex dump string for two byte slices, making it easier
+// to spot differences in binary data.
+func hexDiff(got, want []byte) string {
+	var b strings.Builder
+	b.WriteString("\n") // Start with a newline for better formatting in test logs.
+	b.WriteString(fmt.Sprintf("       | %-23s | %-23s |\n", "GOT", "WANT"))
+	b.WriteString("-------+-------------------------+-------------------------|\n")
+	for i := 0; i < max(len(got), len(want)); i++ {
+		b.WriteString(fmt.Sprintf("%04x   |", i))
+		if i < len(got) {
+			b.WriteString(fmt.Sprintf(" %02x                      |", got[i]))
+		} else {
+			b.WriteString("                         |")
+		}
+		if i < len(want) {
+			b.WriteString(fmt.Sprintf(" %02x                      |", want[i]))
+		} else {
+			b.WriteString("                         |")
+		}
+		if i < len(got) && i < len(want) && got[i] != want[i] {
+			b.WriteString(" <<< MISMATCH")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func checkSection(t *testing.T, sectionName string, got, want []byte) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Errorf("Mismatch in %s: lengths got=%d, want=%d. Diff:%s",
+			sectionName, len(got), len(want), hexDiff(got, want))
+	}
+}
+
+type testCase struct {
+	prog            string
+	extractArg      func(*Prog) Arg
+	regionArray     []byte
+	relocationTable []byte
+	payload         []byte
+}
+
+func TestMarshallKFuzzTestArg(t *testing.T) {
+	testCases := []testCase{
+		{
+			`r0 = openat$cgroup_ro(0xffffffffffffff9c, &(0x7f00000003c0)='cpuacct.stat\x00', 0x26e1, 0x0)
+sendmsg$nl_xfrm(r0, &(0x7f0000000240)={0x0, 0x0, &(0x7f0000000080)={&(0x7f00000001c0)=ANY=[], 0x33fe0}}, 0x0)`,
+			func(p *Prog) Arg {
+				sendMsgCall := p.Calls[1]
+				msgHdr := sendMsgCall.Args[1].(*PointerArg).Res
+				return msgHdr
+			},
+			[]byte{
+				0x03, 0x00, 0x00, 0x00,
+
+				// region 0: the top-level struct msghdr.
+				0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, // Start = 0 | Size = 56.
+
+				// region 1: iovec
+				0x40, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // Start = 0x40 | size = 16 bytes.
+
+				// region 2: array[ANYUNION]
+				0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Start = 0x58 | size = 0 bytes.
+			},
+			[]byte{ // Header: nentries = 3.
+				0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Num entries | Offset to payload = 0x0.
+
+				// entries[0]: nil pointer at offset 0 of region 0.
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RegionID | Offset.
+				0xFF, 0xFF, 0xFF, 0xFF, // Null pointer.
+
+				// entries[1]: pointer to vec (region 1) at offset 16 of region 0.
+				0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // RegionID | Offset.
+				0x01, 0x00, 0x00, 0x00, // Region 1.
+
+				// entries[2]: pointer to array (region 2) at offset 0 of region 1.
+				0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RegionID | Offset.
+				0x02, 0x00, 0x00, 0x00, // Region 1.
+			},
+			[]byte{
+				// Payload for region 0 (msghdr_netlink)
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Pointer placeholder for `addr`
+				0x00, 0x00, 0x00, 0x00, // `addrlen` = 4 bytes
+				0x00, 0x00, 0x00, 0x00, // `pad` = 4 bytes
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Pointer placeholder for `vec`
+				0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // `vlen` = 8 bytes
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // `ctrl` = 8 bytes
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // `ctrllen` = 8 bytes
+				0x00, 0x00, 0x00, 0x00, // `f` = 4 bytes
+				0x00, 0x00, 0x00, 0x00, // `pad` = 4 bytes
+
+				// Padding between region 0 and region 1.
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+				// Payload for region 1 (iovec)
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Pointer placeholder for `addr`
+				0xe0, 0x3f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, // `len` = 8 bytes
+
+				// Padding between region 1 and region 2.
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+				// Payload for region 2 (empty array) is zero-length, no data.
+
+				// Final padding at the end of the payload.
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		testOne(t, tc)
+	}
+}
+
+func testOne(t *testing.T, tc testCase) {
+	target, err := GetTarget("linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := target.Deserialize([]byte(tc.prog), NonStrict)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arg := tc.extractArg(p)
+	encoded := marshallKFuzztestArg(arg)
+
+	regionArrayLen := len(tc.regionArray)
+	relocTableLen := len(tc.relocationTable)
+	// payloadLen := len(tc.payload)
+
+	// if len(encoded) != regionArrayLen+relocTableLen+payloadLen {
+	// 	t.Fatalf("encoded output has wrong total length: got %d, want %d",
+	// 		len(encoded), regionArrayLen+relocTableLen+payloadLen)
+	// }
+
+	gotRegionArray := encoded[:regionArrayLen]
+	gotRelocTable := encoded[regionArrayLen : regionArrayLen+relocTableLen]
+	gotPayload := encoded[relocTableLen+regionArrayLen:]
+
+	checkSection(t, "Relocation Table", gotRelocTable, tc.relocationTable)
+	checkSection(t, "Region Array", gotRegionArray, tc.regionArray)
+	checkSection(t, "Payload", gotPayload, tc.payload)
 }

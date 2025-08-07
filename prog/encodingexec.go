@@ -151,7 +151,7 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 		panic("serializeKFuzzTestCall called on an invalid syscall")
 	}
 
-	// Write the initial string argument (test name) normally
+	// Write the initial string argument (test name) normally.
 	w.writeCopyin(&Call{Meta: c.Meta, Args: []Arg{c.Args[0]}})
 
 	// Args[1] is the second argument to syz_kfuzztest_run, which is a pointer
@@ -175,7 +175,7 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 
 	// Update the value of the length arg which should now match the length of
 	// the byte array that we created. Previously, it contained the bytesize
-	// of the struct argument passed into the pseudo-syscall
+	// of the struct argument passed into the pseudo-syscall.
 	lenArg := c.Args[2].(*ConstArg)
 	lenArg.Val = uint64(len(finalBlob))
 
@@ -247,149 +247,258 @@ func (w *execContext) writeCopyin(c *Call) {
 }
 
 // Special value for making null pointers that equals (void *)-1
-const kFuzzTestNilPtrVal uint64 = ^uint64(0)
+const kFuzzTestNilPtrVal uint32 = ^uint32(0)
 
-// Number of integers of padding
-const relocationTablePaddingInts uint32 = 2
+const poisonMinSize uint64 = 0x8
 
-// marshallKFuzztestArg serializes a top-level struct argument (`topLevel`) into
-// a single binary blob that can be consumed by the kernel. The output format,
-// defined in `linux/include/kftf.h`, is designed for position-independent data
-// transfer and consists of a relocation table followed by a raw data payload.
-//
-// The function serializes the tree-like Arg structure using a level-order
-// traversal. This approach ensures that nested structures are
-// ensuring that nested structures are laid out contiguously in memory. If
-// pointer arguments are found, the pointed-to data will be laid out directly
-// after the structure that the pointer is found in.
-//
-// The process works as follows:
-//  1. All non-pointer fields of the input struct are processed first from a
-//     queue, and their raw data is written sequentially into the main `payload`
-//     buffer.
-//  2. When a pointer is encountered, a placeholder is written into the payload,
-//     and a `relocationEntry` is created and deferred to a separate pointer
-//     queue. The `entry.pointer` field is set to the current offset within the
-//     payload.
-//  3. After all primary struct data is serialized, the pointer queue is
-//     processed. The data pointed to by each deferred entry is serialized at
-//     the end of the payload, and the `entry.value` is calculated as the
-//     relative offset between the pointer's location and its target data.
-//  4. Finally, the completed `relocation_table` is serialized and prepended to
-//     the `payload` buffer to form the complete binary blob.
-func marshallKFuzztestArg(topLevel Arg) []byte {
-	type deferredPtr struct {
-		pointedToArg Arg
-		pointer      uint64
+func isPowerOfTwo(n uint64) bool {
+	return n > 0 && (n&(n-1) == 0)
+}
+
+func roundToNearestMultiple(x, n uint64) uint64 {
+	if !isPowerOfTwo(n) {
+		panic("n was not a power of 2")
 	}
+	return (x + (n >> 1)) &^ (n - 1)
+}
+
+// Pad b so that it's length is a multiple of alignment, with at least
+// minPadding bytes of padding, where alignment is a power of 2.
+func padWithAlignment(b *bytes.Buffer, alignment, minPadding uint64) {
+	var newSize uint64
+	if alignment == 0 {
+		newSize = uint64(b.Len()) + minPadding
+	} else {
+		newSize = roundToNearestMultiple(uint64(b.Len())+minPadding, alignment)
+	}
+
+	paddingBytes := newSize - uint64(b.Len())
+	for range paddingBytes {
+		b.WriteByte(byte(0))
+	}
+}
+
+// marshallKFuzzTestArg serializes a syzkaller Arg into a flat binary format
+// understood by the KFuzzTest kernel interface (see `include/linux/kfuzztest.h`).
+//
+// The goal is to represent a tree-like structure of arguments (which may contain
+// pointers and cycles) as a single byte slice that the kernel can deserialize
+// into a set of distinct heap allocations.
+//
+// The binary format consists of three contiguous parts, in this order:
+//
+//  1. Region Array: A header describing all logical memory regions that will be
+//     allocated by the kernel. Each `relocRegion` defines a region's unique `id`,
+//     its `size`, its `alignment`, and its `start` offset within the payload.
+//     The kernel uses this table to create one distinct heap allocation per region.
+//
+//  2. Relocation Table: A header containing a list of `relocationEntry` structs.
+//     Each entry identifies the location of a pointer field within the payload
+//     (via a `regionID` and `regionOffset`) and maps it to the logical region
+//     it points to (via a `value` which holds the pointee's `regionID`).
+//     A NULL pointer is identified by the special value `kFuzzTestNilPtrVal`.
+//
+//  3. Payload: The raw, serialized data for all arguments, laid out as a single
+//     contiguous block of memory.
+//
+// The serialization algorithm performs a multi-level, level-order traversal of the
+// argument graph, starting from the `topLevel` argument. This traversal is managed
+// by two queues: one for the immediate fields of a struct, and a second "deferred"
+// queue for the pointees of any pointer arguments. This ensures that when a
+// pointer is encountered, its pointee is only expanded after the entire
+// structure containing the pointer has been serialized into the payload.
+//
+// Cycles are handled by tracking visited arguments, ensuring that a region for a
+// given pointee is allocated only once.
+//
+// For a concrete example of the final binary layout, see the test cases for this
+// function in `prog/encodingexec_test.go`.
+func marshallKFuzztestArg(topLevel Arg) []byte {
 	// see `linux/include/kftf.h`
 	type relocationEntry struct {
-		pointer uint64
-		value   uint64
+		// Region that a pointer belongs to.
+		regionID uint32
+		// Offset within its own region.
+		regionOffset uint32
+		// Contains a region identifier, or kfuzzTestNilPtrVal if nil.
+		value uint32
+	}
+	// Defines a unit of allocation made by the KFuzzTest parser.
+	type relocRegion struct {
+		// Identifier for this region, corresponding to its index in the
+		// resulting relocation region array. See `include/linux/kftf.h`
+		id uint32
+		// Offset of the start of the region in the payload.
+		start uint32
+		// Size of the region in bytes.
+		size uint32
+	}
+	// Argument bundled with the memory region that it belongs to.
+	type argWithRegionID struct {
+		arg      Arg
+		regionID uint32
 	}
 	// Given a slice of relocation table entries, encodes them in the binary
 	// format expected by the kernel.
-	generateRelocationTable := func(relocationTableEntries []relocationEntry, maxAlignment uint32) []byte {
+	generateRelocationTable := func(relocationTableEntries []relocationEntry, paddingBytes uint32) []byte {
 		var relocationTable bytes.Buffer
-		numEntries := int32(len(relocationTableEntries))
-		padding := make([]byte, relocationTablePaddingInts*4)
+		numEntries := uint32(len(relocationTableEntries))
 		binary.Write(&relocationTable, binary.LittleEndian, numEntries)
-		binary.Write(&relocationTable, binary.LittleEndian, maxAlignment)
-		binary.Write(&relocationTable, binary.LittleEndian, padding)
+		binary.Write(&relocationTable, binary.LittleEndian, paddingBytes)
 		for _, entry := range relocationTableEntries {
-			binary.Write(&relocationTable, binary.LittleEndian, uint64(entry.pointer))
-			binary.Write(&relocationTable, binary.LittleEndian, uint64(entry.value))
+			binary.Write(&relocationTable, binary.LittleEndian, entry.regionID)
+			binary.Write(&relocationTable, binary.LittleEndian, entry.regionOffset)
+			binary.Write(&relocationTable, binary.LittleEndian, entry.value)
 		}
 		return relocationTable.Bytes()
 	}
+	// Given a map of discovered regions, generates the region table encoded
+	// in the binary format expected by the kernel.
+	generateRegionArray := func(regionsMap map[Arg]relocRegion) []byte {
+		var regionArray bytes.Buffer
+
+		arr := make([]relocRegion, len(regionsMap))
+		for _, region := range regionsMap {
+			// Since the regionID encodes its index in the regions array, and
+			// is monotonically increasing.
+			arr[region.id] = region
+		}
+		numEntries := uint32(len(arr))
+		binary.Write(&regionArray, binary.LittleEndian, numEntries)
+
+		for _, region := range arr {
+			binary.Write(&regionArray, binary.LittleEndian, region.start)
+			binary.Write(&regionArray, binary.LittleEndian, region.size)
+		}
+		return regionArray.Bytes()
+	}
 
 	// It is possible that the fuzzer will pass an invalid pointer to the
-	// executor. In this case, to maintain compatibility to with the protocol
-	// running on the kernel, we just output an empty relocation table.
+	// executor. In this case, we send an empty relocation table and region
+	// array.
 	if topLevel == nil {
-		return generateRelocationTable([]relocationEntry{}, 1)
+		return append(generateRelocationTable([]relocationEntry{}, 0), generateRegionArray(make(map[Arg]relocRegion))...)
 	}
+
+	// The top-level argument should always be a struct, and therefore of type
+	// GroupArg.
+	switch topLevel.(type) {
+	case *GroupArg:
+	default:
+		panic("top-level argument was not a GroupArg")
+	}
+
+	// Allocates a new logical heap region with strictly increasing IDs.
+	regionCtr := uint32(0)
+	allocRegion := func(size uint32) relocRegion {
+		reg := relocRegion{id: regionCtr, size: size}
+		regionCtr++
+		return reg
+	}
+
+	// Allocate a region for the top-level argument. This is always region 0,
+	// irrespective on whether there are other regions or not. We currently
+	// set the alignment to 0x8. TODO: handle this alignment in kernel.
+	regionForTopLevel := allocRegion(uint32(topLevel.Size()))
 
 	// Two-levels of queuing - those that must be handled directly (constants,
-	// nested structures) and those that must be handled afterwards. This
-	// implements a level-order traversal starting at `topLevel` such that we
-	// only expand pointed-to data after all constants in the current structure
-	// have already been laid out in the payload.
-	layoutQueue := []Arg{topLevel}
-	deferredPointers := make([]deferredPtr, 0)
+	// nested structures) and pointee arguments whose handling should be
+	// deferred. This implements a level-order traversal starting at `topLevel`
+	// such that we only expand pointees after the structure pointing to it has
+	// been completely serialized into the payload.
+	layoutQueue := []argWithRegionID{{topLevel, regionForTopLevel.id}}
+	deferredPointers := []argWithRegionID{}
 
 	relocationTableEntries := make([]relocationEntry, 0)
-	maxAlignment := uint32(topLevel.Type().Alignment())
 	var payload bytes.Buffer
 
-	// Aligns the current position in the payload to an alignment threshold.
-	alignPayload := func(alignment uint64) {
-		// It seems that some types will have 0-alignment
-		if alignment == 0 {
-			return
-		}
-		for {
-			if uint64(payload.Len())%alignment == 0 {
-				return
-			}
-			payload.WriteByte(byte(0))
-		}
-	}
+	// Handle cycles created by pointer arguments, and maps a pointee to its
+	// dedicated heap allocation.
+	visited := make(map[Arg]relocRegion)
+	visited[topLevel] = regionForTopLevel
 
+	maxAlignment := uint64(0)
+	offsetInRegion := uint32(0)
 	for {
 		if len(layoutQueue) == 0 && len(deferredPointers) == 0 {
 			break
 		}
 		// Pop from layoutQueue if anything is available, else pop from the
 		// deferredPointers which contains pointed-to data that we must handle
-		var arg Arg
+		var argWithReg argWithRegionID
 		if len(layoutQueue) > 0 {
-			arg = layoutQueue[0]
+			argWithReg = layoutQueue[0]
 			layoutQueue = layoutQueue[1:]
 		} else if len(deferredPointers) > 0 {
-			// pop from deferredPointers and create a relocation table entry
-			dp := deferredPointers[0]
+			// Expanding a pointee. This indicates the start of a new region.
+			offsetInRegion = 0
+			// Pop from deferredPointers and create a relocation table entry.
+			argWithReg = deferredPointers[0]
 			deferredPointers = deferredPointers[1:]
+			// We now know the start of the region, and thereore can update
+			// this.
+			reg, ok := visited[argWithReg.arg]
+			if !ok {
+				panic("tried to visit a pointee without having allocated a region for it")
+			}
+			// Pad the space between regions, aligning to this region's
+			// alignment.
+			padWithAlignment(&payload, argWithReg.arg.Type().Alignment(), poisonMinSize)
 
-			currOffset := uint64(payload.Len())
-			value := currOffset - dp.pointer
-			relocationTableEntries = append(relocationTableEntries,
-				relocationEntry{pointer: dp.pointer, value: value})
-			arg = dp.pointedToArg
+			reg.start = uint32(payload.Len())
+			visited[argWithReg.arg] = reg
 		} else {
 			panic("at least one queue should have remaining entries at this point")
 		}
 
-		maxAlignment = max(maxAlignment, uint32(arg.Type().Alignment()))
-		alignPayload(arg.Type().Alignment())
+		padWithAlignment(&payload, argWithReg.arg.Type().Alignment(), 0)
 
-		switch a := arg.(type) {
+		maxAlignment = max(maxAlignment, argWithReg.arg.Type().Alignment())
+
+		sizeBeforeWrite := payload.Len()
+		switch a := argWithReg.arg.(type) {
 		case *PointerArg:
-			ptrOffset := payload.Len()
 			// We write a placeholder value. It doesn't matter what is written
 			// here because the kernel will patch these pointers based only on
-			// the relocation table.
-			binary.Write(&payload, binary.LittleEndian, uint64(0xBFACE))
-			// Ignore nil pointers and pointers that point to empty data to
-			// avoid creating a relocation table entry.
-			if a.Res != nil && a.Res.Size() > 0 {
-				deferred := deferredPtr{
-					pointedToArg: a.Res,
-					pointer:      uint64(ptrOffset),
+			// the relocation table and region array. We write a value that is
+			// easily identifiable in the output byte-stream.
+			binary.Write(&payload, binary.LittleEndian, uint64(0xFFFFFFFFFFFFFFFF))
+			if a.Res != nil {
+				reg, contains := visited[a.Res]
+				// Allocate a new region for the pointee and queue it for
+				// expansion if we haven't visited it yet. We always align to
+				// 8 bytes.
+				if !contains {
+					reg = allocRegion(uint32(a.Res.Size()))
+					visited[a.Res] = reg
+					// Visit the new region, marking the offset as 0.
+					deferred := argWithRegionID{arg: a.Res, regionID: reg.id}
+					deferredPointers = append(deferredPointers, deferred)
 				}
-				deferredPointers = append(deferredPointers, deferred)
+				// In any case, we store the region that this pointer points to.
+				relocationTableEntries = append(relocationTableEntries, relocationEntry{
+					regionID:     argWithReg.regionID,
+					regionOffset: offsetInRegion,
+					value:        reg.id,
+				})
 			} else {
 				// NULL pointer. We directly create a relocation table entry
-				// with the reserved value for NULL pointers.
+				// with the reserved value.
 				relocationTableEntries = append(relocationTableEntries, relocationEntry{
-					pointer: uint64(ptrOffset),
-					value:   kFuzzTestNilPtrVal,
+					regionOffset: offsetInRegion,
+					value:        kFuzzTestNilPtrVal,
 				})
 			}
-		// handle non-pointer arguments by writing them into the payload buffer
+		// Handle non-pointer arguments by writing them into the payload buffer.
 		case *GroupArg:
+			offsetInGroup := uint64(0)
 			for _, inner := range a.Inner {
-				layoutQueue = append(layoutQueue, inner)
+				layoutQueue = append(layoutQueue,
+					argWithRegionID{
+						arg:      inner,
+						regionID: argWithReg.regionID,
+					})
+				offsetInGroup += inner.Size()
 			}
 		case *DataArg:
 			data := a.Data()
@@ -408,15 +517,35 @@ func marshallKFuzztestArg(topLevel Arg) []byte {
 			default:
 				panic(fmt.Sprintf("unsupported constant size: %d", a.Size()))
 			}
+			// TODO: handle union args.
 		default:
 			panic(fmt.Sprintf("tried to serialize unsupported type: %s", a.Type().Name()))
 		}
+		sizeAfterWrite := payload.Len()
+		// Update the offset within the region. Ensures that we maintain the
+		// correct relative offset.
+		offsetInRegion += uint32(sizeAfterWrite) - uint32(sizeBeforeWrite)
 	}
 
-	// loop over relocation entries
-	relocationTableBytes := generateRelocationTable(relocationTableEntries, maxAlignment)
-	out := append(relocationTableBytes, payload.Bytes()...)
-	return out
+	// Pad the end of the payload so that it can be poisoned.
+	binary.Write(&payload, binary.LittleEndian, uint64(0))
+
+	var out bytes.Buffer
+
+	regionArray := generateRegionArray(visited)
+	relocationTableNumBytes := len(generateRelocationTable(relocationTableEntries, 0x0))
+	headerLen := len(regionArray) + relocationTableNumBytes
+
+	// Round up the current total length to the nearest multiple of maxAlignment.
+	paddingBytes := roundToNearestMultiple(uint64(headerLen), maxAlignment) - uint64(headerLen)
+
+	out.Write(regionArray)
+	out.Write(generateRelocationTable(relocationTableEntries, uint32(paddingBytes)))
+	out.Write(make([]byte, paddingBytes))
+
+	out.Write(payload.Bytes())
+
+	return out.Bytes()
 }
 
 func (w *execContext) willBeUsed(arg Arg) bool {
