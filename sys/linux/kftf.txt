@@ -1,0 +1,22 @@
+# this code was automatically generated, do not modify
+
+nested {
+	value	int8
+}
+
+top_level {
+	nested	nested
+}
+
+kftf_simple_arg {
+	first	top_level
+	second	nested
+	third	top_level
+}
+
+int_sqrt_arg {
+	x	int64
+}
+
+syz_kfuzztest_run$int_sqrt(name ptr[in, string["int_sqrt"]], data ptr[in, int_sqrt_arg], len bytesize[data])
+syz_kfuzztest_run$kftf_fuzzable(name ptr[in, string["kftf_fuzzable"]], data ptr[in, kftf_simple_arg], len bytesize[data])
