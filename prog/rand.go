@@ -368,10 +368,6 @@ func (r *randGen) randString(s *state, t *BufferType) []byte {
 }
 
 func (r *randGen) allocAddr(s *state, typ Type, dir Dir, size uint64, data Arg) *PointerArg {
-	_, isStruct := data.(*GroupArg)
-	if r.genKFuzzTest && isStruct {
-		size = KFuzzTestMaxInputSize
-	}
 	return MakePointerArg(typ, dir, s.ma.alloc(r, size, data.Type().Alignment()), data)
 }
 

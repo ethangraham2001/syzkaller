@@ -75,7 +75,10 @@ func (p *Prog) SerializeForExec() ([]byte, error) {
 	w.write(uint64(len(p.Calls)))
 	for _, c := range p.Calls {
 		w.csumMap, w.csumUses = calcChecksumsCall(c)
-		w.serializeCall(c)
+		err := w.serializeCall(c)
+		if err != nil {
+			return nil, err
+		}
 	}
 	w.write(execInstrEOF)
 	if len(w.buf) > ExecBufferSize {
@@ -87,13 +90,12 @@ func (p *Prog) SerializeForExec() ([]byte, error) {
 	return w.buf, nil
 }
 
-func (w *execContext) serializeCall(c *Call) {
+func (w *execContext) serializeCall(c *Call) error {
 	// We introduce special serialization logic for kfuzztest targets, which
 	// require special handling due to their use of relocation tables to copy
 	// entire blobs of data into the kenrel.
 	if c.Meta.Attrs.KFuzzTest {
-		w.serializeKFuzzTestCall(c)
-		return
+		return w.serializeKFuzzTestCall(c)
 	}
 
 	// Calculate arg offsets within structs.
@@ -125,12 +127,13 @@ func (w *execContext) serializeCall(c *Call) {
 
 	// Generate copyout instructions that persist interesting return values.
 	w.writeCopyout(c)
+	return nil
 }
 
 // KFuzzTest targets require special handling due to their use of relocation
 // tables for serializing all data (including pointed-to data) into a
 // continuous blob that can be passed into the kernel.
-func (w *execContext) serializeKFuzzTestCall(c *Call) {
+func (w *execContext) serializeKFuzzTestCall(c *Call) error {
 	if !c.Meta.Attrs.KFuzzTest {
 		// This is a specialized function that shouldn't be called on anything
 		// other than an instance of a syz_kfuzztest_run$* syscall
@@ -145,12 +148,17 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 	// to the fuzzing driver with a relocation table.
 	dataArg := c.Args[1].(*PointerArg)
 	finalBlob := MarshallKFuzztestArg(dataArg.Res)
+	if len(finalBlob) > int(KFuzzTestMaxInputSize) {
+		return fmt.Errorf("encoded blob was too large")
+	}
 
-	// Reuse the memory address that was pre-allocated for the original struct
-	// argument. This avoids needing to hook into the memory allocation which
-	// is done at a higher level than the serialization. This relies on the
-	// original buffer being large enough
-	blobAddress := w.target.PhysicalAddr(dataArg) - w.target.DataOffset
+	// Use the buffer argument as data offset - this represents a buffer of
+	// size 64KiB - the maximum input size that the KFuzzTest module accepts.
+	bufferArg := c.Args[3].(*PointerArg)
+	if bufferArg.Res == nil {
+		return fmt.Errorf("buffer was nil")
+	}
+	blobAddress := w.target.PhysicalAddr(bufferArg) - w.target.DataOffset
 
 	// Write the entire marshalled blob as a raw byte array.
 	w.write(execInstrCopyin)
@@ -176,6 +184,7 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 	for _, arg := range c.Args {
 		w.writeArg(arg)
 	}
+	return nil
 }
 
 type execContext struct {
