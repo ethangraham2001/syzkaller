@@ -5865,7 +5865,7 @@ static long syz_pidfd_open(volatile long pid, volatile long flags)
 #include <unistd.h>
 
 static long syz_kfuzztest_run(volatile long test_name_ptr, volatile long input_data,
-			      volatile long input_data_size)
+			      volatile long input_data_size, volatile long buffer)
 {
 	const char* test_name = (const char*)test_name_ptr;
 	if (!test_name) {
@@ -5874,6 +5874,10 @@ static long syz_kfuzztest_run(volatile long test_name_ptr, volatile long input_d
 	}
 	if (!input_data || input_data_size == 0) {
 		debug("syz_kfuzztest_run: input data was NULL\n");
+		return -1;
+	}
+	if (!buffer) {
+		debug("syz_kfuzztest_run: buffer was NULL\n");
 		return -1;
 	}
 

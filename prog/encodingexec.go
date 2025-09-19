@@ -145,12 +145,15 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) {
 	// to the fuzzing driver with a relocation table.
 	dataArg := c.Args[1].(*PointerArg)
 	finalBlob := MarshallKFuzztestArg(dataArg.Res)
+	if len(finalBlob) > int(KFuzzTestMaxInputSize) {
+		// Panic for now, but this is a temporary measure.
+		panic("encoded blob was too large")
+	}
 
-	// Reuse the memory address that was pre-allocated for the original struct
-	// argument. This avoids needing to hook into the memory allocation which
-	// is done at a higher level than the serialization. This relies on the
-	// original buffer being large enough
-	blobAddress := w.target.PhysicalAddr(dataArg) - w.target.DataOffset
+	// Use the buffer argument as data offset - this represents a buffer of
+	// size 64KiB - the maximum input size that the KFuzzTest module accepts.
+	bufferArg := c.Args[3].(*PointerArg)
+	blobAddress := w.target.PhysicalAddr(bufferArg) - w.target.DataOffset
 
 	// Write the entire marshalled blob as a raw byte array.
 	w.write(execInstrCopyin)
